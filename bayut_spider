@@ -1,0 +1,77 @@
+import scrapy
+import json
+
+
+class BayutSpider(scrapy.Spider):
+    name = "bayut_spider"
+    allowed_domains = ["bayut.com"]
+    start_urls = ["https://www.bayut.com/to-rent/property/dubai/"]
+
+    def parse(self, response):
+        property_links = response.xpath('//a[@aria-label="Listing link"]/@href').getall()
+        for link in property_links:
+            full_url = response.urljoin(link)
+            yield scrapy.Request(full_url, callback=self.parse_property)
+
+        next_page = response.xpath('//a[@title="Next"]/@href').get()
+        if next_page:
+            yield response.follow(next_page, callback=self.parse)
+
+    def parse_property(self, response):
+        def extract_xpath(query):
+            return response.xpath(query).get(default="").strip()
+
+        def extract_all_xpath(query):
+            return [i.strip() for i in response.xpath(query).getall() if i.strip()]
+
+        # Extract JSON-LD block
+        json_ld = {}
+        for node in response.xpath('//script[@type="application/ld+json"]/text()'):
+            try:
+                data = json.loads(node.get())
+                if isinstance(data, dict) and data.get("@type") in ["Apartment", "Product", "SingleFamilyResidence"]:
+                    json_ld = data
+                    break
+            except Exception:
+                continue
+
+        offer = json_ld.get("offers", {})
+
+        yield {
+            "property_id": extract_xpath('//span[contains(text(), "Reference")]/following-sibling::span[1]/text()'),
+            "property_url": response.url,
+            "purpose": extract_xpath('//span[contains(text(), "Purpose")]/following-sibling::span[1]/text()') or "For Rent",
+            "type": extract_xpath('//span[contains(text(), "Type")]/following-sibling::span[1]/text()') or json_ld.get("@type", ""),
+            "added_on": extract_xpath('//span[contains(text(), "Added on")]/following-sibling::span[1]/text()'),
+            "furnishing": extract_xpath('//span[contains(text(), "Furnishing")]/following-sibling::span[1]/text()'),
+
+            "price": {
+                "currency": "AED",
+                "amount": extract_xpath('//span[@aria-label="Price"]/text()') or str(offer.get("price", ""))
+            },
+
+            "location": extract_xpath('//h2[@aria-label="Location"]/text()') or json_ld.get("address", {}).get("addressLocality", ""),
+
+            "bed_bath_size": {
+                "bedrooms": extract_xpath('//span[@aria-label="Beds"]/text()') or str(json_ld.get("numberOfRooms", "")),
+                "bathrooms": extract_xpath('//span[@aria-label="Baths"]/text()') or str(json_ld.get("numberOfBathroomsTotal", "")),
+                "size": extract_xpath('//span[contains(text(),"sqft")]/text()') or str(json_ld.get("floorSize", {}).get("value", ""))
+            },
+
+            "permit_number": extract_xpath('//span[contains(text(),"Permit Number")]/following-sibling::span[1]/text()'),
+
+            "agent_name": extract_xpath('//a[@aria-label="Agent name"]/text()') or extract_xpath('//div[@aria-label="Agent name"]/text()'),
+
+            "primary_image_url": extract_xpath('(//div[@aria-label="Gallery"]//img/@src)[1]') or json_ld.get("image", ""),
+
+            "breadcrumbs": " > ".join(
+                extract_all_xpath('//nav[contains(@aria-label,"Breadcrumb")]/ol/li/a/span/text()')
+            ),
+
+            "amenities": extract_all_xpath('//section[@aria-label="Amenities"]//li//span/text()') or
+                         extract_all_xpath('//div[@aria-label="Amenities"]//li//span/text()'),
+
+            "description": extract_xpath('//div[@aria-label="Description"]//div/text()') or
+                           " ".join(extract_all_xpath('//div[@aria-label="Description"]//text()')) or
+                           json_ld.get("description", "")
+        }
